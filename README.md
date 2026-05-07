@@ -158,6 +158,124 @@ validate the shares.
 Since `Pedersen` returns a large amount of information after a split the `PedersenResult` trait is used to encapsulate
 the data. `StdPedersenResult` is provided when an allocator is available by default.
 
+### Pinned shares across re-splits (educational)
+
+`shamir::split_secret_with_fixed_shares` lets you generate a new Shamir
+splitting whose polynomial agrees with a set of `(identifier, value)`
+pairs carried over from a previous splitting. The new secret can be the
+same as the old one (proactive re-sharing) **or completely different**;
+the pinning constraint is independent of the secret value.
+
+```rust
+use vsss_rs::{*, shamir};
+
+// Split 1: standard 3/5 Shamir over secret_a.
+let split1 = shamir::split_secret::<MyShare>(3, 5, &secret_a, &mut rng).unwrap();
+
+// Split 2: NEW secret_b, but force the new polynomial to reproduce
+// split1[0] verbatim. The new polynomial p2 satisfies
+//   p2(0) = secret_b      (new secret)
+//   p2(split1[0].id) = split1[0].val   (carried over from p1)
+let pin = split1[0].clone();
+let split2 = shamir::split_secret_with_fixed_shares::<MyShare>(
+    3, 5, &secret_b, core::slice::from_ref(&pin), &mut rng,
+).unwrap();
+assert_eq!(split2[0], pin);
+```
+
+How it works (`p(x) = L(x) + r(x)`):
+- `L(x)` — Lagrange interpolation through `(0, new_secret)` plus all
+  pinned `(x_i, y_i)` points (`k + 1` constraints).
+- `r(x) = x · Π(x − x_i) · q(x)`, where `q(x)` is a random polynomial of
+  degree `t − 2 − k`. `r` vanishes at `0` and at every pinned `x_i`, so
+  adding it preserves all constraints while injecting fresh entropy on
+  every other coordinate.
+
+Constraints:
+- `2 ≤ threshold ≤ limit`
+- `fixed_shares.len() < threshold` (with `k = threshold − 1` pins the
+  polynomial is fully determined and the new "split" is deterministic)
+- All pinned identifiers distinct and non-zero
+
+**Security warning.** Standard Shamir gives information-theoretic
+secrecy: any `t − 1` shares reveal *zero* information about the secret.
+Pinned splits keep that property for the new secret — `t − 1` shares of
+the new polynomial (whether pinned or freshly generated) still leave the
+new secret uniformly distributed over the field. The trade-off is
+*coupling*: two splittings that share a pinned point become linked. If
+an attacker recovers `t` shares of *either* polynomial they learn the
+shared `(id, value)` point, which counts as one extra equation against
+*every* polynomial that also pinned it. Treat this primitive as an
+educational / proactive-secret-sharing building block — not a way to
+"refresh" a secret in isolation.
+
+A full runnable demo (Splits 1–6, including pinning across multiple
+prior splittings into a brand-new secret) lives at
+[`examples/demo.rs`](examples/demo.rs):
+
+```bash
+cargo run --example demo --all-features
+```
+
+### Pinned shares across re-splits (educational)
+
+`shamir::split_secret_with_fixed_shares` lets you generate a new Shamir
+splitting whose polynomial agrees with a set of `(identifier, value)`
+pairs carried over from a previous splitting. The new secret can be the
+same as the old one (proactive re-sharing) **or completely different**;
+the pinning constraint is independent of the secret value.
+
+```rust
+use vsss_rs::{*, shamir};
+
+// Split 1: standard 3/5 Shamir over secret_a.
+let split1 = shamir::split_secret::<MyShare>(3, 5, &secret_a, &mut rng).unwrap();
+
+// Split 2: NEW secret_b, but force the new polynomial to reproduce
+// split1[0] verbatim. The new polynomial p2 satisfies
+//   p2(0) = secret_b      (new secret)
+//   p2(split1[0].id) = split1[0].val   (carried over from p1)
+let pin = split1[0].clone();
+let split2 = shamir::split_secret_with_fixed_shares::<MyShare>(
+    3, 5, &secret_b, core::slice::from_ref(&pin), &mut rng,
+).unwrap();
+assert_eq!(split2[0], pin);
+```
+
+How it works (`p(x) = L(x) + r(x)`):
+- `L(x)` — Lagrange interpolation through `(0, new_secret)` plus all
+  pinned `(x_i, y_i)` points (`k + 1` constraints).
+- `r(x) = x · Π(x − x_i) · q(x)`, where `q(x)` is a random polynomial of
+  degree `t − 2 − k`. `r` vanishes at `0` and at every pinned `x_i`, so
+  adding it preserves all constraints while injecting fresh entropy on
+  every other coordinate.
+
+Constraints:
+- `2 ≤ threshold ≤ limit`
+- `fixed_shares.len() < threshold` (with `k = threshold − 1` pins the
+  polynomial is fully determined and the new "split" is deterministic)
+- All pinned identifiers distinct and non-zero
+
+**Security note.** Standard Shamir gives information-theoretic secrecy:
+any `t − 1` shares reveal *zero* information about the secret. Pinned
+splits keep that property for the new secret — `t − 1` shares of the
+new polynomial (whether pinned or freshly generated) still leave the
+new secret uniformly distributed over the field. The trade-off is
+*coupling*: two splittings that share a pinned point become linked. If
+an attacker recovers `t` shares of *either* polynomial they learn the
+shared `(id, value)` point, which counts as one extra equation against
+*every* polynomial that also pinned it. Treat this primitive as an
+educational / proactive-secret-sharing building block — not a way to
+"refresh" a secret in isolation.
+
+A full runnable demo (Splits 1–6, including pinning across multiple
+prior splittings into a brand-new secret) lives at
+[`examples/demo.rs`](examples/demo.rs):
+
+```bash
+cargo run --example demo --all-features
+```
+
 ### Other noteworthy items
 
 When operating in standard mode, no traits should be necessary to be implemented and there are default functions
