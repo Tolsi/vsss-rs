@@ -217,64 +217,37 @@ prior splittings into a brand-new secret) lives at
 cargo run --example demo --all-features
 ```
 
-### Pinned shares across re-splits (educational)
+#### `pinned-shamir` CLI
 
-`shamir::split_secret_with_fixed_shares` lets you generate a new Shamir
-splitting whose polynomial agrees with a set of `(identifier, value)`
-pairs carried over from a previous splitting. The new secret can be the
-same as the old one (proactive re-sharing) **or completely different**;
-the pinning constraint is independent of the secret value.
-
-```rust
-use vsss_rs::{*, shamir};
-
-// Split 1: standard 3/5 Shamir over secret_a.
-let split1 = shamir::split_secret::<MyShare>(3, 5, &secret_a, &mut rng).unwrap();
-
-// Split 2: NEW secret_b, but force the new polynomial to reproduce
-// split1[0] verbatim. The new polynomial p2 satisfies
-//   p2(0) = secret_b      (new secret)
-//   p2(split1[0].id) = split1[0].val   (carried over from p1)
-let pin = split1[0].clone();
-let split2 = shamir::split_secret_with_fixed_shares::<MyShare>(
-    3, 5, &secret_b, core::slice::from_ref(&pin), &mut rng,
-).unwrap();
-assert_eq!(split2[0], pin);
-```
-
-How it works (`p(x) = L(x) + r(x)`):
-- `L(x)` — Lagrange interpolation through `(0, new_secret)` plus all
-  pinned `(x_i, y_i)` points (`k + 1` constraints).
-- `r(x) = x · Π(x − x_i) · q(x)`, where `q(x)` is a random polynomial of
-  degree `t − 2 − k`. `r` vanishes at `0` and at every pinned `x_i`, so
-  adding it preserves all constraints while injecting fresh entropy on
-  every other coordinate.
-
-Constraints:
-- `2 ≤ threshold ≤ limit`
-- `fixed_shares.len() < threshold` (with `k = threshold − 1` pins the
-  polynomial is fully determined and the new "split" is deterministic)
-- All pinned identifiers distinct and non-zero
-
-**Security note.** Standard Shamir gives information-theoretic secrecy:
-any `t − 1` shares reveal *zero* information about the secret. Pinned
-splits keep that property for the new secret — `t − 1` shares of the
-new polynomial (whether pinned or freshly generated) still leave the
-new secret uniformly distributed over the field. The trade-off is
-*coupling*: two splittings that share a pinned point become linked. If
-an attacker recovers `t` shares of *either* polynomial they learn the
-shared `(id, value)` point, which counts as one extra equation against
-*every* polynomial that also pinned it. Treat this primitive as an
-educational / proactive-secret-sharing building block — not a way to
-"refresh" a secret in isolation.
-
-A full runnable demo (Splits 1–6, including pinning across multiple
-prior splittings into a brand-new secret) lives at
-[`examples/demo.rs`](examples/demo.rs):
+A small command-line wrapper that exposes the three primitives over
+p256 scalars lives at [`examples/pinned-shamir.rs`](examples/pinned-shamir.rs):
 
 ```bash
-cargo run --example demo --all-features
+cargo build --example pinned-shamir --all-features --release
+PS=./target/release/examples/pinned-shamir
+
+# 1. Split: 3-of-5 over the phrase "test"
+$PS split 3 5 --text "test" > shares.txt
+
+# 2. Combine: any 3 shares recover the secret
+head -3 shares.txt | $PS combine
+# hex:  0000...0074657374
+# text: test
+
+# 3. Resplit with a NEW secret while pinning shares from the old set.
+#    `--pin` is repeatable; `--pin-file <path>` reads pins from a file.
+P1=$(sed -n 1p shares.txt)
+P2=$(sed -n 2p shares.txt)
+$PS resplit 3 5 --text "other" --pin "$P1" --pin "$P2" > new.txt
+head -3 new.txt | $PS combine
+# hex:  0000...006f74686572
+# text: other
 ```
+
+Share line format (used by all three subcommands):
+`<id_hex64>:<value_hex64>` — 32-byte big-endian p256 scalars in lowercase
+hex, one share per line. Secrets are accepted as `--text "..."`
+(zero-padded UTF-8, ≤ 32 bytes) or `--hex <64-char-hex>`.
 
 ### Other noteworthy items
 
