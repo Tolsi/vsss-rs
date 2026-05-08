@@ -253,6 +253,72 @@ When typing shares interactively into `combine`, end input with EOF:
 **Ctrl+D** on Unix/macOS, **Ctrl+Z then Enter** on Windows. Or use
 `--shares-file <path>` / pipe (`head -3 shares.txt | $PS combine`).
 
+### Recovering additional shares
+
+`shamir::recover_shares_with_default_generator` lets you recover additional
+shares from a secret and a threshold of known shares. This is useful when you
+need to generate more shares after the original split, or when you want to
+reconstruct all N shares from the secret and any K shares.
+
+The "default generator" refers to the default participant identifier scheme:
+shares are assigned sequential IDs starting from 1 (1, 2, 3, ...). This matches
+the behavior of `split_secret`. If you used custom identifiers during the
+original split, use `shamir::recover_shares` with the same generator instead.
+
+```rust
+use vsss_rs::{split_secret, recover_shares_with_default_generator, DefaultShare, IdentifierPrimeField};
+use k256::Scalar;
+use rand_core::OsRng;
+
+let mut rng = OsRng;
+let secret = IdentifierPrimeField(Scalar::random(&mut rng));
+
+// Original split: 3-of-5 (uses default sequential IDs: 1, 2, 3, 4, 5)
+let original_shares = split_secret::<DefaultShare<_, _>>(3, 5, &secret, &mut rng).unwrap();
+
+// Recover all 5 shares from secret + any 3 known shares
+let recovered = recover_shares_with_default_generator(
+    3,          // threshold
+    5,          // total shares to generate
+    &secret,
+    &original_shares[..3], // any 3 shares
+).unwrap();
+
+// recovered shares match the original
+assert_eq!(recovered.len(), 5);
+```
+
+You can also use `shamir::recover_shares` with custom participant generators
+if you need specific share identifiers.
+
+### Additive Refresh (Proactive Secret Sharing)
+
+`shamir::additive_refresh_shares` updates shares without reconstructing the secret.
+Each share receives a random delta. The deltas are generated such that their sum is
+zero (using a random polynomial with zero constant term), so the original secret
+is mathematically preserved — but the secret is never computed.
+
+This is useful for proactive secret sharing: refreshing shares to limit exposure
+time. Both old and new shares remain valid (they both reconstruct the same secret).
+
+```rust
+use vsss_rs::{split_secret, additive_refresh_shares, DefaultShare, IdentifierPrimeField};
+use k256::Scalar;
+use rand_core::OsRng;
+
+let mut rng = OsRng;
+let secret = IdentifierPrimeField(Scalar::random(&mut rng));
+
+// Original split: 3-of-5
+let old_shares = split_secret::<DefaultShare<_, _>>(3, 5, &secret, &mut rng).unwrap();
+
+// Refresh: get new shares (secret stays the same, never revealed)
+let new_shares = additive_refresh_shares(&old_shares, &mut rng).unwrap();
+
+// Both old and new shares reconstruct the same secret
+assert_eq!(old_shares.combine().unwrap(), new_shares.combine().unwrap());
+```
+
 ### Other noteworthy items
 
 When operating in standard mode, no traits should be necessary to be implemented and there are default functions

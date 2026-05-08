@@ -42,6 +42,7 @@ fn run(argv: &[String]) -> Result<(), String> {
         "combine" => cmd_combine(&argv[2..]),
         "resplit" => cmd_resplit(&argv[2..]),
         "extend" => cmd_extend(&argv[2..]),
+        "refresh" => cmd_refresh(&argv[2..]),
         "help" | "-h" | "--help" | "" => {
             print_help();
             Ok(())
@@ -60,7 +61,9 @@ fn print_help() {
         \x20         (--pin <id_hex>:<val_hex> | --pin-file <path>)...\n\
         \x20 extend  <new_limit> [--shares-file <path>]\n\
         \x20         (reads >= threshold input shares, mints additional ones\n\
-        \x20          on the same polynomial; threshold inferred from input count)\n\n\
+        \x20          on the same polynomial; threshold inferred from input count)\n\
+        \x20 refresh [--shares-file <path>]\n\
+        \x20         (additive refresh: updates shares without reconstructing secret)\n\n\
         Share line format: <id_hex64>:<value_hex64> (one per line)."
     );
 }
@@ -151,11 +154,19 @@ fn nibble_hex(n: u8) -> char {
 }
 
 fn share_to_line(s: &ShareT) -> String {
-    format!(
-        "{}:{}",
-        encode_hex(s.identifier.0.to_repr().as_ref()),
-        encode_hex(s.value.0.to_repr().as_ref()),
-    )
+    let id_hex = encode_hex_strip_leading_zeros(s.identifier.0.to_repr().as_ref());
+    let val_hex = encode_hex(s.value.0.to_repr().as_ref());
+    format!("{id_hex}:{val_hex}")
+}
+
+fn encode_hex_strip_leading_zeros(bytes: &[u8]) -> String {
+    let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    let stripped = &bytes[first_nonzero..];
+    if stripped.is_empty() {
+        "0".to_string()
+    } else {
+        encode_hex(stripped)
+    }
 }
 
 fn parse_share_line(line: &str) -> Result<ShareT, String> {
@@ -163,14 +174,53 @@ fn parse_share_line(line: &str) -> Result<ShareT, String> {
     let (id_s, val_s) = line
         .split_once(':')
         .ok_or_else(|| format!("bad share line: `{line}` (expected id:value)"))?;
-    let id_bytes = decode_hex32(id_s)?;
-    let val_bytes = decode_hex32(val_s)?;
-    let id = scalar_from_bytes(&id_bytes)?;
-    let val = scalar_from_bytes(&val_bytes)?;
+    let id_s = id_s.trim();
+    let val_s = val_s.trim();
+    let mut id_bytes = decode_hex(id_s)?;
+    let val_bytes = decode_hex(val_s)?;
+
+    // Pad ID to 32 bytes
+    if id_bytes.len() < 32 {
+        let mut padded = vec![0u8; 32 - id_bytes.len()];
+        padded.extend_from_slice(&id_bytes);
+        id_bytes = padded;
+    }
+
+    let id_arr: [u8; 32] = id_bytes.try_into().map_err(|_| "id must be 32 bytes")?;
+    let val_arr: [u8; 32] = val_bytes.try_into().map_err(|_| "value must be 32 bytes")?;
+
+    let id = scalar_from_bytes(&id_arr)?;
+    let val = scalar_from_bytes(&val_arr)?;
     Ok(DefaultShare {
         identifier: IdentifierPrimeField(id),
         value: IdentifierPrimeField(val),
     })
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+    if s.len() % 2 != 0 {
+        return Err("hex string must have even length".into());
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    for chunk in s.as_bytes().chunks(2) {
+        let hi = from_nibble(chunk[0])? << 4;
+        let lo = from_nibble(chunk[1])?;
+        bytes.push(hi | lo);
+    }
+    Ok(bytes)
+}
+
+fn from_nibble(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(format!("invalid hex char: {}", b as char)),
+    }
 }
 
 fn parse_t_n(args: &[String]) -> Result<(usize, usize), String> {
@@ -216,9 +266,7 @@ fn cmd_combine(args: &[String]) -> Result<(), String> {
     if shares.is_empty() {
         return Err("no shares supplied".into());
     }
-    let secret = shares
-        .combine()
-        .map_err(|e| format!("combine: {e:?}"))?;
+    let secret = shares.combine().map_err(|e| format!("combine: {e:?}"))?;
     let bytes = secret.0.to_repr();
     let bytes_ref = bytes.as_ref();
     println!("hex:  {}", encode_hex(bytes_ref));
@@ -249,10 +297,9 @@ fn cmd_resplit(args: &[String]) -> Result<(), String> {
         return Err("no pins supplied (use --pin or --pin-file)".into());
     }
 
-    let shares = shamir::split_secret_with_fixed_shares::<ShareT>(
-        t, n, &wrapped, &pins, &mut OsRng,
-    )
-    .map_err(|e| format!("resplit: {e:?}"))?;
+    let shares =
+        shamir::split_secret_with_fixed_shares::<ShareT>(t, n, &wrapped, &pins, &mut OsRng)
+            .map_err(|e| format!("resplit: {e:?}"))?;
     let mut out = io::stdout().lock();
     for s in &shares {
         writeln!(out, "{}", share_to_line(s)).unwrap();
@@ -291,9 +338,7 @@ fn cmd_extend(args: &[String]) -> Result<(), String> {
     }
 
     // Recover the secret from the supplied threshold shares.
-    let secret = inputs
-        .combine()
-        .map_err(|e| format!("combine: {e:?}"))?;
+    let secret = inputs.combine().map_err(|e| format!("combine: {e:?}"))?;
 
     // Pin t-1 of the inputs. Together with (0, secret) this fully determines
     // the original polynomial, so any new evaluation lies on it.
@@ -335,6 +380,33 @@ fn cmd_extend(args: &[String]) -> Result<(), String> {
         return Err(format!(
             "could not generate {want_new} new ids (only {emitted})"
         ));
+    }
+    Ok(())
+}
+
+fn cmd_refresh(args: &[String]) -> Result<(), String> {
+    let lines: Vec<String> = if let Some(path) = pop_flag(args, "--shares-file") {
+        read_lines_file(&path)?
+    } else {
+        read_lines_stdin()?
+    };
+    let inputs: Vec<ShareT> = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| parse_share_line(l))
+        .collect::<Result<_, _>>()?;
+
+    let n = inputs.len();
+    if n < 2 {
+        return Err(format!("need at least 2 shares, got {n}"));
+    }
+
+    let new_shares = shamir::additive_refresh_shares(&inputs, OsRng)
+        .map_err(|e| format!("refresh: {e:?}"))?;
+
+    let mut out = io::stdout().lock();
+    for s in &new_shares {
+        writeln!(out, "{}", share_to_line(s)).unwrap();
     }
     Ok(())
 }

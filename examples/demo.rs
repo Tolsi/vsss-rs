@@ -118,7 +118,10 @@ fn main() {
     .unwrap();
     print_shares("S4", &split4);
 
-    println!("  S4[0] == S1[0]?                      {}", split4[0] == pinned);
+    println!(
+        "  S4[0] == S1[0]?                      {}",
+        split4[0] == pinned
+    );
     let r4 = split4[..3].to_vec().combine().unwrap();
     println!(
         "  combine S4[0..3] -> matches secret_b? {} (matches old secret? {})",
@@ -162,8 +165,11 @@ fn main() {
     .unwrap();
     print_shares("S5", &split5);
 
-    println!("  S5[0] == S1[2]? {}  S5[1] == S4[3]? {}",
-        split5[0] == split1[2], split5[1] == split4[3]);
+    println!(
+        "  S5[0] == S1[2]? {}  S5[1] == S4[3]? {}",
+        split5[0] == split1[2],
+        split5[1] == split4[3]
+    );
     let r5 = split5[..3].to_vec().combine().unwrap();
     println!(
         "  combine S5[0..3] -> secret_c? {} (secret_a? {}, secret_b? {})",

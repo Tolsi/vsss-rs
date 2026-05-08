@@ -325,6 +325,174 @@ fn eval_pinned_polynomial<S: Share>(
     Ok(acc)
 }
 
+#[cfg(any(feature = "alloc", feature = "std"))]
+/// Recover `limit` shares from a secret and `threshold` known shares.
+///
+/// This reconstructs the Shamir polynomial using the secret at x=0 and the
+/// provided `known_shares` (at their x coordinates), then evaluates it at
+/// `limit` new points.
+///
+/// # Arguments
+/// * `threshold` - The minimum number of shares needed to reconstruct (must equal `known_shares.len()`)
+/// * `limit` - The total number of shares to generate
+/// * `secret` - The original secret value (at x=0)
+/// * `known_shares` - At least `threshold` shares from the original split
+/// * `participant_generators` - Identifiers for the output shares
+///
+/// # Returns
+/// A vector of `limit` shares
+///
+/// # Example
+/// ```ignore
+/// use vsss_rs::{split_secret, recover_shares_with_default_generator, DefaultShare, IdentifierPrimeField};
+/// use k256::Scalar;
+/// use rand_core::OsRng;
+///
+/// let mut rng = OsRng;
+/// let secret = IdentifierPrimeField(Scalar::random(&mut rng));
+/// let shares = split_secret::<DefaultShare<_, _>>(3, 5, &secret, &mut rng).unwrap();
+///
+/// // Recover all 5 shares from secret + 3 known shares
+/// let recovered = recover_shares_with_default_generator(3, 5, &secret, &shares[..3]).unwrap();
+/// ```
+pub fn recover_shares<S: Share>(
+    threshold: usize,
+    limit: usize,
+    secret: &S::Value,
+    known_shares: &[S],
+    participant_generators: &[ParticipantIdGeneratorType<S::Identifier>],
+) -> VsssResult<Vec<S>> {
+    check_params(threshold, limit)?;
+    let k = known_shares.len();
+    if k != threshold {
+        return Err(Error::InvalidSizeRequest);
+    }
+    for fs in known_shares {
+        if fs.identifier().is_zero().into() {
+            return Err(Error::SharingInvalidIdentifier);
+        }
+        for fs2 in known_shares.iter() {
+            if fs.identifier() == fs2.identifier() && !core::ptr::eq(fs, fs2) {
+                return Err(Error::SharingDuplicateIdentifier);
+            }
+        }
+    }
+
+    let participant_id_collection = ParticipantIdGeneratorCollection::from(participant_generators);
+    let mut id_iter = participant_id_collection.iter();
+
+    let mut out: Vec<S> = Vec::with_capacity(limit);
+    while out.len() < limit {
+        let id = id_iter.next().ok_or(Error::NotEnoughShareIdentifiers)?;
+        if known_shares.iter().any(|fs| fs.identifier() == &id) {
+            continue;
+        }
+        let value = eval_pinned_polynomial::<S>(secret, known_shares, &[], &id)?;
+        out.push(S::with_identifier_and_value(id, value));
+    }
+    Ok(out)
+}
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+/// Recover `limit` shares from a secret and `threshold` known shares using default participant generator.
+///
+/// Convenience wrapper around [`recover_shares`] that uses the default sequential
+/// identifier generator.
+pub fn recover_shares_with_default_generator<S: Share>(
+    threshold: usize,
+    limit: usize,
+    secret: &S::Value,
+    known_shares: &[S],
+) -> VsssResult<Vec<S>> {
+    let generator = ParticipantIdGeneratorType::<S::Identifier>::default();
+    recover_shares(threshold, limit, secret, known_shares, &[generator])
+}
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+/// Additive Refresh: update shares without reconstructing the secret.
+///
+/// Each share receives a random delta. The sum of all deltas is zero,
+/// so the original secret is preserved. This is useful for proactive
+/// secret sharing — refreshing shares to limit exposure time.
+///
+/// # Arguments
+/// * `old_shares` - The original shares (must have at least 2)
+/// * `rng` - Random number generator
+///
+/// # Returns
+/// New shares with the same identifiers but different values.
+///
+/// # Example
+/// ```ignore
+/// use vsss_rs::{split_secret, additive_refresh_shares, DefaultShare, IdentifierPrimeField};
+/// use k256::Scalar;
+/// use rand_core::OsRng;
+///
+/// let mut rng = OsRng;
+/// let secret = IdentifierPrimeField(Scalar::random(&mut rng));
+/// let old_shares = split_secret::<DefaultShare<_, _>>(3, 5, &secret, &mut rng).unwrap();
+///
+/// // Refresh: get new shares (secret stays the same)
+/// let new_shares = additive_refresh_shares(&old_shares, &mut rng).unwrap();
+/// assert_eq!(old_shares.combine().unwrap(), new_shares.combine().unwrap());
+/// ```
+pub fn additive_refresh_shares<S>(
+    old_shares: &[S],
+    mut rng: impl RngCore + CryptoRng,
+) -> VsssResult<Vec<S>>
+where
+    S: Share,
+    S::Identifier: ShareIdentifier,
+    S::Value: core::ops::Sub<Output = S::Value>,
+{
+    let n = old_shares.len();
+    if n < 2 {
+        return Err(Error::SharingMinThreshold);
+    }
+
+    for s in old_shares {
+        if s.identifier().is_zero().into() {
+            return Err(Error::SharingInvalidIdentifier);
+        }
+    }
+
+    for i in 0..n {
+        for j in i + 1..n {
+            if old_shares[i].identifier() == old_shares[j].identifier() {
+                return Err(Error::SharingDuplicateIdentifier);
+            }
+        }
+    }
+
+    let zero = S::Identifier::zero();
+    let mut r_coeffs: Vec<S::Identifier> = Vec::with_capacity(n);
+    r_coeffs.push(zero);
+    for _ in 1..n {
+        r_coeffs.push(S::Identifier::random_coefficient(&mut rng));
+    }
+
+    let mut new_shares: Vec<S> = Vec::with_capacity(n);
+    for old in old_shares.iter() {
+        let mut r_val = r_coeffs[n - 1].clone();
+        for i in (0..n - 1).rev() {
+            *r_val.as_mut() *= old.identifier().as_ref();
+            *r_val.as_mut() += r_coeffs[i].as_ref();
+        }
+        let delta = S::Value::from(&r_val);
+
+        let mut new_val = old.value().clone();
+        let mut nv = new_val.clone();
+        *nv.as_mut() += delta.as_ref();
+        new_val = nv;
+        new_shares.push(S::with_identifier_and_value(
+            old.identifier().clone(),
+            new_val,
+        ));
+    }
+
+    Ok(new_shares)
+}
+
 #[cfg(all(test, any(feature = "alloc", feature = "std")))]
 mod fixed_share_tests {
     use super::*;
@@ -404,5 +572,201 @@ mod fixed_share_tests {
             split_secret_with_fixed_shares::<S>(3, 5, &secret, &dups, &mut rng).unwrap_err(),
             Error::SharingDuplicateIdentifier
         );
+    }
+}
+
+#[cfg(all(test, any(feature = "alloc", feature = "std")))]
+mod recover_shares_tests {
+    use super::*;
+    use crate::{DefaultShare, IdentifierPrimeField};
+    use elliptic_curve::Field;
+    use rand_core::OsRng;
+
+    type S = DefaultShare<IdentifierPrimeField<k256::Scalar>, IdentifierPrimeField<k256::Scalar>>;
+
+    #[test]
+    fn recover_shares_from_secret_and_threshold_shares() {
+        let mut rng = OsRng;
+        let secret = IdentifierPrimeField(k256::Scalar::random(&mut rng));
+        let original = split_secret::<S>(3, 5, &secret, &mut rng).unwrap();
+
+        let recovered =
+            recover_shares_with_default_generator::<S>(3, 5, &secret, &original[..3]).unwrap();
+
+        assert_eq!(recovered.len(), 5);
+        for (i, share) in recovered.iter().enumerate() {
+            if let Some(orig) = original
+                .iter()
+                .find(|s| s.identifier() == share.identifier())
+            {
+                assert_eq!(share, orig, "share {} should match original", i);
+            }
+        }
+        assert_eq!(recovered.combine().unwrap(), secret);
+    }
+
+    #[test]
+    fn recover_shares_with_different_limit() {
+        let mut rng = OsRng;
+        let secret = IdentifierPrimeField(k256::Scalar::random(&mut rng));
+        let original = split_secret::<S>(3, 10, &secret, &mut rng).unwrap();
+
+        let recovered =
+            recover_shares_with_default_generator::<S>(3, 7, &secret, &original[..3]).unwrap();
+
+        assert_eq!(recovered.len(), 7);
+        assert_eq!(recovered.combine().unwrap(), secret);
+    }
+
+    #[test]
+    fn recover_shares_rejects_invalid_threshold() {
+        let mut rng = OsRng;
+        let secret = IdentifierPrimeField(k256::Scalar::random(&mut rng));
+        let original = split_secret::<S>(3, 5, &secret, &mut rng).unwrap();
+
+        let result = recover_shares_with_default_generator::<S>(3, 5, &secret, &original[..2]);
+        assert_eq!(result.unwrap_err(), Error::InvalidSizeRequest);
+    }
+
+    #[test]
+    fn recover_shares_rejects_zero_identifier() {
+        let mut rng = OsRng;
+        let secret = IdentifierPrimeField(k256::Scalar::random(&mut rng));
+        let bad_share = DefaultShare {
+            identifier: IdentifierPrimeField(k256::Scalar::ZERO),
+            value: IdentifierPrimeField(k256::Scalar::random(&mut rng)),
+        };
+        let valid_share1 = DefaultShare {
+            identifier: IdentifierPrimeField(k256::Scalar::ONE),
+            value: IdentifierPrimeField(k256::Scalar::random(&mut rng)),
+        };
+        let valid_share2 = DefaultShare {
+            identifier: IdentifierPrimeField(k256::Scalar::from(2u64)),
+            value: IdentifierPrimeField(k256::Scalar::random(&mut rng)),
+        };
+
+        let result = recover_shares_with_default_generator::<S>(
+            3,
+            5,
+            &secret,
+            &[bad_share, valid_share1, valid_share2],
+        );
+        assert_eq!(result.unwrap_err(), Error::SharingInvalidIdentifier);
+    }
+}
+
+#[cfg(all(test, any(feature = "alloc", feature = "std")))]
+mod additive_refresh_tests {
+    use super::*;
+    use crate::DefaultShare;
+    use elliptic_curve::Field;
+    use rand_core::OsRng;
+
+    type S = DefaultShare<IdentifierPrimeField<k256::Scalar>, IdentifierPrimeField<k256::Scalar>>;
+
+    #[test]
+    fn additive_refresh_preserves_secret() {
+        let mut rng = OsRng;
+        let secret = IdentifierPrimeField(k256::Scalar::random(&mut rng));
+
+        let old_shares = split_secret::<S>(3, 5, &secret, &mut rng).unwrap();
+        let old_combined = old_shares.combine().unwrap();
+
+        let new_shares = additive_refresh_shares::<S>(&old_shares, &mut rng).unwrap();
+        let new_combined = new_shares.combine().unwrap();
+
+        assert_eq!(old_combined, new_combined, "secret should be preserved");
+    }
+
+    #[test]
+    fn additive_refresh_changes_values() {
+        let mut rng = OsRng;
+        let secret = IdentifierPrimeField(k256::Scalar::random(&mut rng));
+
+        let old_shares = split_secret::<S>(3, 5, &secret, &mut rng).unwrap();
+        let new_shares = additive_refresh_shares::<S>(&old_shares, &mut rng).unwrap();
+
+        for (old, new) in old_shares.iter().zip(new_shares.iter()) {
+            assert_ne!(
+                old.value(),
+                new.value(),
+                "value should change for each share"
+            );
+        }
+    }
+
+    #[test]
+    fn additive_refresh_preserves_identifiers() {
+        let mut rng = OsRng;
+        let secret = IdentifierPrimeField(k256::Scalar::random(&mut rng));
+
+        let old_shares = split_secret::<S>(3, 5, &secret, &mut rng).unwrap();
+        let new_shares = additive_refresh_shares::<S>(&old_shares, &mut rng).unwrap();
+
+        for (old, new) in old_shares.iter().zip(new_shares.iter()) {
+            assert_eq!(
+                old.identifier(),
+                new.identifier(),
+                "identifier should be preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn additive_refresh_different_sizes() {
+        let mut rng = OsRng;
+        let secret = IdentifierPrimeField(k256::Scalar::random(&mut rng));
+
+        for threshold in [2, 3, 5] {
+            let old_shares = split_secret::<S>(threshold, threshold, &secret, &mut rng).unwrap();
+            let new_shares = additive_refresh_shares::<S>(&old_shares, &mut rng).unwrap();
+
+            assert_eq!(old_shares.len(), new_shares.len());
+            assert_eq!(old_shares.combine().unwrap(), new_shares.combine().unwrap());
+        }
+    }
+
+    #[test]
+    fn additive_refresh_rejects_zero_identifier() {
+        let mut rng = OsRng;
+        let bad_share = DefaultShare {
+            identifier: IdentifierPrimeField(k256::Scalar::ZERO),
+            value: IdentifierPrimeField(k256::Scalar::random(&mut rng)),
+        };
+        let valid_share = DefaultShare {
+            identifier: IdentifierPrimeField(k256::Scalar::ONE),
+            value: IdentifierPrimeField(k256::Scalar::random(&mut rng)),
+        };
+
+        let result = additive_refresh_shares::<S>(&[bad_share, valid_share], &mut rng);
+        assert_eq!(result.unwrap_err(), Error::SharingInvalidIdentifier);
+    }
+
+    #[test]
+    fn additive_refresh_rejects_duplicate_identifier() {
+        let mut rng = OsRng;
+        let share1 = DefaultShare {
+            identifier: IdentifierPrimeField(k256::Scalar::ONE),
+            value: IdentifierPrimeField(k256::Scalar::random(&mut rng)),
+        };
+        let share2 = DefaultShare {
+            identifier: IdentifierPrimeField(k256::Scalar::ONE),
+            value: IdentifierPrimeField(k256::Scalar::random(&mut rng)),
+        };
+
+        let result = additive_refresh_shares::<S>(&[share1, share2], &mut rng);
+        assert_eq!(result.unwrap_err(), Error::SharingDuplicateIdentifier);
+    }
+
+    #[test]
+    fn additive_refresh_rejects_single_share() {
+        let mut rng = OsRng;
+        let share = DefaultShare {
+            identifier: IdentifierPrimeField(k256::Scalar::ONE),
+            value: IdentifierPrimeField(k256::Scalar::random(&mut rng)),
+        };
+
+        let result = additive_refresh_shares::<S>(&[share], &mut rng);
+        assert_eq!(result.unwrap_err(), Error::SharingMinThreshold);
     }
 }

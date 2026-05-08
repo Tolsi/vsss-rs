@@ -4,7 +4,7 @@ use core::{
     cmp::Ordering,
     fmt::{self, Display, Formatter},
     hash::{Hash, Hasher},
-    ops::{Deref, DerefMut, Mul},
+    ops::{Deref, DerefMut, Mul, Sub},
 };
 #[cfg(feature = "bigint")]
 use elliptic_curve::{
@@ -152,6 +152,22 @@ impl<F: PrimeField> Mul<&IdentifierPrimeField<F>> for IdentifierPrimeField<F> {
 
     fn mul(self, rhs: &IdentifierPrimeField<F>) -> Self::Output {
         Self(self.0 * rhs.0)
+    }
+}
+
+impl<F: PrimeField> Sub<&IdentifierPrimeField<F>> for IdentifierPrimeField<F> {
+    type Output = IdentifierPrimeField<F>;
+
+    fn sub(self, rhs: &IdentifierPrimeField<F>) -> Self::Output {
+        Self(self.0 - rhs.0)
+    }
+}
+
+impl<F: PrimeField> Sub for IdentifierPrimeField<F> {
+    type Output = IdentifierPrimeField<F>;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self(self.0 - rhs.0)
     }
 }
 
