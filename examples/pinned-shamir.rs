@@ -41,6 +41,7 @@ fn run(argv: &[String]) -> Result<(), String> {
         "split" => cmd_split(&argv[2..]),
         "combine" => cmd_combine(&argv[2..]),
         "resplit" => cmd_resplit(&argv[2..]),
+        "extend" => cmd_extend(&argv[2..]),
         "help" | "-h" | "--help" | "" => {
             print_help();
             Ok(())
@@ -56,7 +57,10 @@ fn print_help() {
         \x20 split   <threshold> <limit> --text <s>|--hex <h>\n\
         \x20 combine [--shares-file <path>]\n\
         \x20 resplit <threshold> <limit> --text <s>|--hex <h>\n\
-        \x20         (--pin <id_hex>:<val_hex> | --pin-file <path>)...\n\n\
+        \x20         (--pin <id_hex>:<val_hex> | --pin-file <path>)...\n\
+        \x20 extend  <new_limit> [--shares-file <path>]\n\
+        \x20         (reads >= threshold input shares, mints additional ones\n\
+        \x20          on the same polynomial; threshold inferred from input count)\n\n\
         Share line format: <id_hex64>:<value_hex64> (one per line)."
     );
 }
@@ -252,6 +256,85 @@ fn cmd_resplit(args: &[String]) -> Result<(), String> {
     let mut out = io::stdout().lock();
     for s in &shares {
         writeln!(out, "{}", share_to_line(s)).unwrap();
+    }
+    Ok(())
+}
+
+fn cmd_extend(args: &[String]) -> Result<(), String> {
+    let new_limit: usize = args
+        .first()
+        .ok_or("missing <new_limit>")?
+        .parse()
+        .map_err(|e| format!("new_limit parse: {e}"))?;
+
+    let lines: Vec<String> = if let Some(path) = pop_flag(args, "--shares-file") {
+        read_lines_file(&path)?
+    } else {
+        read_lines_stdin()?
+    };
+    let inputs: Vec<ShareT> = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| parse_share_line(l))
+        .collect::<Result<_, _>>()?;
+
+    let threshold = inputs.len();
+    if threshold < 2 {
+        return Err(format!(
+            "need at least 2 input shares (threshold), got {threshold}"
+        ));
+    }
+    if new_limit <= threshold {
+        return Err(format!(
+            "new_limit ({new_limit}) must exceed input count / threshold ({threshold})"
+        ));
+    }
+
+    // Recover the secret from the supplied threshold shares.
+    let secret = inputs
+        .combine()
+        .map_err(|e| format!("combine: {e:?}"))?;
+
+    // Pin t-1 of the inputs. Together with (0, secret) this fully determines
+    // the original polynomial, so any new evaluation lies on it.
+    let pins: Vec<ShareT> = inputs[..threshold - 1].to_vec();
+    let want_new = new_limit - threshold;
+
+    // Ask split_secret_with_fixed_shares for one extra slot — the default
+    // sequential generator will hit the unpinned input id and we need to
+    // skip it to avoid emitting a duplicate.
+    let resplit = shamir::split_secret_with_fixed_shares::<ShareT>(
+        threshold,
+        new_limit + 1,
+        &secret,
+        &pins,
+        &mut OsRng,
+    )
+    .map_err(|e| format!("extend: {e:?}"))?;
+
+    let mut out = io::stdout().lock();
+    // Preserve original input shares verbatim at the head.
+    for s in &inputs {
+        writeln!(out, "{}", share_to_line(s)).unwrap();
+    }
+    // Emit fresh shares from the resplit, skipping any whose id collides
+    // with an input share (in particular the unpinned threshold-th input).
+    let input_ids: Vec<_> = inputs.iter().map(|s| s.identifier.clone()).collect();
+    let mut emitted = 0usize;
+    for s in resplit.iter().skip(threshold - 1) {
+        if input_ids.contains(&s.identifier) {
+            continue;
+        }
+        writeln!(out, "{}", share_to_line(s)).unwrap();
+        emitted += 1;
+        if emitted == want_new {
+            break;
+        }
+    }
+    if emitted < want_new {
+        return Err(format!(
+            "could not generate {want_new} new ids (only {emitted})"
+        ));
     }
     Ok(())
 }

@@ -249,6 +249,10 @@ Share line format (used by all three subcommands):
 hex, one share per line. Secrets are accepted as `--text "..."`
 (zero-padded UTF-8, ≤ 32 bytes) or `--hex <64-char-hex>`.
 
+When typing shares interactively into `combine`, end input with EOF:
+**Ctrl+D** on Unix/macOS, **Ctrl+Z then Enter** on Windows. Or use
+`--shares-file <path>` / pipe (`head -3 shares.txt | $PS combine`).
+
 ### Other noteworthy items
 
 When operating in standard mode, no traits should be necessary to be implemented and there are default functions
